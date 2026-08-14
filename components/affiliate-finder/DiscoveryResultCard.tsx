@@ -1,11 +1,56 @@
 "use client";
 
+import { Download } from "lucide-react";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/shared/card";
 import { Button } from "@/components/shared/button";
 import { Checkbox } from "@/components/shared/checkbox";
 import { DataTable, type DataTableColumn } from "@/components/shared/data-table";
 import { formatFollowers, formatMoney, formatPercent } from "@/lib/affiliate-finder/format";
 import type { Category, CreatorSummary } from "@/lib/affiliate-finder/types";
+
+function csvEscape(value: string): string {
+  if (/[",\n]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+// Exports the full top-10 discovery list as-is — deliberately available
+// whether or not the user has selected/confirmed anything, since a brand
+// user may just want the raw shortlist without running contact enrichment.
+function downloadDiscoveryCsv(category: Category, candidates: CreatorSummary[]) {
+  const headers = [
+    "Username",
+    "Display Name",
+    "Profile URL",
+    "Followers",
+    "Engagement Rate",
+    "GMV (estimated)",
+    "Items Sold (estimated)",
+  ];
+  const rows = candidates.map((c) => [
+    c.username,
+    c.displayName,
+    c.profileUrl,
+    String(c.followers),
+    String(c.engagementRate),
+    String(c.gmv),
+    String(c.itemsSold),
+  ]);
+  const csv = [headers, ...rows]
+    .map((row) => row.map((cell) => csvEscape(cell)).join(","))
+    .join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `top10-${category}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 export function DiscoveryResultCard({
   category,
@@ -103,7 +148,7 @@ export function DiscoveryResultCard({
             rowKey={(row) => row.id}
           />
         </CardContent>
-        <CardFooter>
+        <CardFooter className="flex items-center justify-between gap-3">
           {confirmed ? (
             <span className="text-sm text-muted-foreground">
               {selectedIds.size} creator{selectedIds.size === 1 ? "" : "s"} selected
@@ -113,6 +158,13 @@ export function DiscoveryResultCard({
               Confirm selection
             </Button>
           )}
+          <Button
+            variant="ghost"
+            onClick={() => downloadDiscoveryCsv(category, candidates)}
+          >
+            <Download className="h-4 w-4 shrink-0" />
+            Export CSV
+          </Button>
         </CardFooter>
       </Card>
     </div>

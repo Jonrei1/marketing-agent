@@ -25,7 +25,7 @@ export const initialConversationState: ConversationState = {
       role: "assistant",
       kind: "text",
       content:
-        "Hi! Pick a category below and I'll pull the top 10 ranked TikTok creators for it.",
+        "Hi! Tell me what kind of TikTok affiliates you're looking for and I'll pull the top 10 ranked creators for it.",
     },
   ],
   category: null,
@@ -38,7 +38,7 @@ export const initialConversationState: ConversationState = {
 
 export type ConversationAction =
   | { type: "USER_MESSAGE"; content: string }
-  | { type: "DISCOVERY_START"; category: Category }
+  | { type: "DISCOVERY_START" }
   | { type: "DISCOVERY_SUCCESS"; category: Category; candidates: CreatorSummary[] }
   | { type: "DISCOVERY_FAIL"; content: string }
   | { type: "TOGGLE_SELECT"; id: string }
@@ -70,7 +70,6 @@ export function conversationReducer(
       return {
         ...state,
         stage: "discovery",
-        category: action.category,
         pending: true,
         messages: [
           ...state.messages,
@@ -78,7 +77,7 @@ export function conversationReducer(
             id: uid("p"),
             role: "assistant",
             kind: "pending",
-            content: `Finding the top 10 ${action.category} creators…`,
+            content: "Finding the top 10 creators for that…",
           },
         ],
       };

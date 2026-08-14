@@ -23,8 +23,10 @@ credits on every call. The user tests manually. Verification for Claude Code mea
 ## What this is
 
 A single-feature demo app: **TikTok Affiliate Finder**, a chat-style flow at `/affiliate-finder`
-(the root `/` redirects there). A brand user describes a need in chat, the assistant discovers the
-top 10 TikTok creators for a category (beauty/skincare/sunscreen), the user selects a subset via
+(the root `/` redirects there), built for **Biocostech**, a sunscreen/skincare brand selling in the
+Philippines. A brand user describes a need in free-text chat, Claude scopes that message down to a
+category + TikTok Shop search keywords, Apify scrapes the top 10 creators for that scope (with real
+product GMV, not an estimate, where the scraper pipeline succeeds), the user selects a subset via
 inline checkboxes, the assistant enriches only the selected creators with contact info, and the
 final table can be exported to CSV. Full spec and constraints: `IMPLEMENTATION.md`.
 
@@ -46,22 +48,23 @@ components/affiliate-finder/
   ChatThread.tsx / MessageBubble.tsx conversation rendering
   DiscoveryResultCard.tsx            inline top-10 table + checkboxes (in an assistant message)
   EnrichmentSummaryCard.tsx          final contact table + client-side CSV export
-  CategoryPillGroup.tsx / ThemeToggle.tsx
+  Composer.tsx / ThemeToggle.tsx     Composer.tsx is the only discovery entry point (free-text chat)
 components/shared/                   hand-rolled Card/Button/Checkbox/DataTable — no shadcn/Base UI
   data-table.tsx                     the one shared table recipe; never hand-roll a raw <table> elsewhere
 lib/affiliate-finder/
   types.ts                           ConversationStage, ChatMessage union, CreatorSummary/Detail
   conversationState.ts               the reducer — the actual state machine (see below)
   mockData.ts                        deterministic mock creators, used as final fallback data
-  discoveryClient.ts                 server-only: primary TikTok discovery + category
-                                      classification via Anthropic (web_search tool)
-  apifyClient.ts                     server-only: fallback TikTok discovery via Apify
+  discoveryClient.ts                 server-only: Claude scoping — free-text message → category +
+                                      TikTok Shop search keywords (no tools, one fast call)
+  apifyClient.ts                     server-only: primary TikTok discovery via Apify (real GMV via
+                                      a TikTok Shop scraper actor, hashtag scraper as its own
+                                      fallback, mock as the final fallback)
   claudeClient.ts                    server-only: bio-parsing enrichment via Anthropic
   format.ts                          number/money formatting (₱, K/M suffixes, tabular-nums)
 lib/rateLimit.ts                     in-memory fixed-window limiter shared by both API routes
-app/api/discover/route.ts            POST { category } (or { message }, unused by the current UI
-                                      but still supported) → discoveryClient.discoverWithClaude,
-                                      falling back to apifyClient.discoverTopCreators
+app/api/discover/route.ts            POST { message } → discoveryClient.scopeRequest (category +
+                                      keywords) → apifyClient.discoverTopCreators
 app/api/enrich/route.ts              POST { creators } → claudeClient.enrichCreators
 ```
 
@@ -77,23 +80,21 @@ read `process.env.ANTHROPIC_API_KEY` / `process.env.APIFY_TOKEN` and are only ev
 their respective route handlers under `app/api/` — never from a client component. The client only
 ever talks to `/api/discover` and `/api/enrich`.
 
-**Discovery fallback chain: Claude → Apify → mock.** `discoveryClient.discoverWithClaude` (Anthropic,
-with the server-side `web_search_20260209` + `web_fetch_20260209` tools) is tried first from
-`app/api/discover/route.ts`; only when it returns `null` (missing key, refusal, empty result, any
-thrown error) does the route fall through to `apifyClient.discoverTopCreators`, which has its own
-internal fallback to `mockData.ts`. This is the reverse of the original Apify-first design — Claude
-is now the primary discovery engine and Apify exists only as a cost-free-tier-safe backstop.
+**Discovery pipeline: Claude scopes, Apify scrapes.** `discoveryClient.scopeRequest` (Anthropic, no
+tools, one short call) reads the user's free-text message and returns a category + up to 3 TikTok
+Shop search keywords, grounded in a Biocostech brand-context string (sunscreen/skincare, PH market —
+see `BRAND_CONTEXT` in that file) so an ambiguous message still scopes sensibly. `app/api/discover/
+route.ts` passes that straight to `apifyClient.discoverTopCreators`, which is the actual discovery
+engine: a TikTok Shop scraper actor (real product GMV, not an estimate) first, the original
+hashtag-based TikTok scraper as its own fallback, and `mockData.ts` as the final fallback. This is
+deliberately NOT the old "Claude finds creators via web_search" design — that chained up to 6
+web_search + 6 web_fetch tool calls per request and was the main source of slow discovery
+turnaround. Claude now does exactly one small, fast, tool-less call per discovery request.
 
-**The UI is pill-only — free-text chat was tried and reverted.** `CategoryPillGroup.tsx` sends
-`{ category }` directly (already resolved, no server-side classification needed); this is
-deliberate. A free-text entry point (`{ message }` → `discoveryClient.classifyCategory`) was built
-to fix a client-side keyword-match bug (`"sunscreen for beauty creators"` resolving to `"beauty"`),
-but classification depended on an `output_config.format.schema` shape that the Anthropic API
-rejected on every single call (see the schema pitfalls below) — so every free-text message was
-silently falling through discovery's whole chain to mock data, which is worse than the bug it was
-meant to fix. The route still accepts `{ message }` and `classifyCategory` is still correct/fixed,
-but nothing in the UI calls it right now. Don't re-add free-text chat without first confirming
-`classifyCategory` actually returns a category end-to-end (not just that it stops throwing).
+**The UI is free-text chat only.** `Composer.tsx` is the sole entry point to discovery — there is no
+category-pill UI. `classifyCategory` (a standalone category-only classifier) has been folded into
+`scopeRequest`, which returns both category and keywords from one call. Chat input is truncated at
+`MAX_MESSAGE_LENGTH` / `MAX_MESSAGE_CHARS` (500) before it reaches Claude, same as before.
 
 **`output_config.format.schema` is stricter than plain JSON Schema — two concrete pitfalls hit in
 this codebase, both 400s on *every* call, not intermittent failures:**
@@ -102,7 +103,7 @@ this codebase, both 400s on *every* call, not intermittent failures:**
 - A field typed `["string", "null"]` with an `enum` listing the string values plus `null` is
   rejected ("Enum value '...' does not match declared type"). Express "one of these strings, or
   null" as `anyOf: [{type: "string", enum: [...]}, {type: "null"}]` instead — see
-  `discoveryClient.ts`'s `CATEGORY_CLASSIFY_SCHEMA` for the working pattern.
+  `discoveryClient.ts`'s `SCOPE_SCHEMA` for the working pattern.
 - Both of the above **fail loudly in the server console** (`[discoveryClient] ... failed:` with the
   raw Anthropic error) but **silently in the UI** — a schema bug here doesn't crash anything, it
   just makes the affected function always return `null`/fall back, which reads as "the feature works
@@ -110,24 +111,23 @@ this codebase, both 400s on *every* call, not intermittent failures:**
   before assuming a discovery/classification quality issue when the real cause could be a rejected
   request.
 
-**Fallback-on-failure is load-bearing, not incidental.** `discoverWithClaude`,
+**Fallback-on-failure is load-bearing, not incidental.** `scopeRequest`,
 `apifyClient.discoverTopCreators`, and `claudeClient.enrichCreators` each catch every failure mode
-(missing key, timeout, bad response, refusal) and fall back to the next link in their chain, always
-returning the same shape as the live path — the UI and the audience can't tell which path ran. When
-touching any of these, preserve this: never let a network failure surface as a broken UI state, and
-never let a fallback function throw.
+(missing key/token, timeout, bad response, refusal) and fall back to the next link in their chain,
+always returning the same shape as the live path — the UI and the audience can't tell which path
+ran. When touching any of these, preserve this: never let a network failure surface as a broken UI
+state, and never let a fallback function throw.
 
 **Built-in limits/cutoffs** (added deliberately for cost control on free-tier/metered APIs — see git
 history for the full rationale):
-- `discoveryClient.ts`: `MAX_RESULTS_PER_CATEGORY = 10` (same cap as Apify, enforced independently),
-  `max_uses: 6` on the web_search tool per discovery call, messages truncated to `MAX_MESSAGE_CHARS`
-  (500, matches `Composer.tsx`) before classification.
-- `apifyClient.ts`: `MAX_RESULTS_PER_CATEGORY = 10`, `APIFY_TIMEOUT_MS = 30_000` (Apify is now the
-  fallback path rather than the first thing tried, so a slower bound is acceptable — still bounded
-  because a hung fallback request must not hang the chat indefinitely), response bounded to 5× the
-  cap before aggregation, and a Philippines-only scope: `proxyCountryCode: "PH"`, PH-specific
-  hashtags only, plus a post-fetch `isPhilippineScoped()` filter that drops any video with an
-  explicit non-PH region/location tag.
+- `discoveryClient.ts`: messages truncated to `MAX_MESSAGE_CHARS` (500, matches `Composer.tsx`)
+  before scoping, `MAX_KEYWORDS = 3` search keywords returned to Apify.
+- `apifyClient.ts`: `MAX_RESULTS_PER_CATEGORY = 10` (hard cap on the final creator list),
+  `MAX_PRODUCTS_FOR_CREATOR_LOOKUP = 5` (top-GMV products looked up for affiliates per request),
+  `APIFY_TIMEOUT_MS = 20_000` (Apify is the primary path now, so this is tighter than before — a
+  slow run must not stall the chat), and a Philippines-only scope on every actor call:
+  `region`/`proxyCountryCode: "PH"`, PH-specific hashtags in the fallback tier, plus a post-fetch
+  `isPhilippineScoped()` filter in that same fallback tier.
 - `claudeClient.ts`: bios truncated to 400 chars, batch capped at 10 creators before the prompt is
   built.
 - `lib/rateLimit.ts`: 5 requests/minute per client IP on both `/api/discover` and `/api/enrich`,
@@ -151,7 +151,8 @@ Path alias: `@/*` maps to the repo root (there is no `src/` directory), e.g. `@/
 ## Environment
 
 `.env` (see `.env.example`) needs `APIFY_TOKEN` and `ANTHROPIC_API_KEY`. Both are optional in the
-sense that every code path has a mock/regex fallback — the app runs fully without either key, just
-without live data. `ANTHROPIC_API_KEY` is now load-bearing for more of the app than just
-enrichment: without it, discovery skips straight to Apify (or mock, if `APIFY_TOKEN` is also unset)
-and free-text category classification always falls through to the "which category?" prompt.
+sense that every code path has a fallback — the app runs fully without either key, just without
+live data. Without `ANTHROPIC_API_KEY`, `scopeRequest` falls back to keyword matching (still returns
+a category + default keywords, never blocks the chat). Without `APIFY_TOKEN`, discovery goes
+straight to mock data — Apify is the actual discovery engine, so this is the more impactful key of
+the two now.

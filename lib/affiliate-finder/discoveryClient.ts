@@ -1,18 +1,23 @@
 // Server-only module: reads process.env.ANTHROPIC_API_KEY and is only ever
 // imported from app/api/discover/route.ts, never from a client component.
 //
-// This is the primary discovery path — Claude, with the server-side web
-// search tool, finds real TikTok creators for a category. apifyClient.ts is
-// the fallback (and mockData is apifyClient's own fallback), so the chain a
-// discovery request travels is: this module -> Apify -> mock. Every function
-// here catches its own failures and returns null so the route can fall
-// through cleanly — never throw out of this module.
+// Claude's job in discovery is SCOPING ONLY, not finding creators itself.
+// scopeRequest reads the user's free-text chat message and turns it into (a)
+// a product category and (b) a short list of TikTok Shop search keywords —
+// one fast, tool-less call. apifyClient.ts takes those keywords and does the
+// actual scraping (real product GMV + affiliate creator discovery), which is
+// the primary discovery engine, with mock data as its own fallback. This
+// replaces the old discoverWithClaude, which used web_search + web_fetch (up
+// to 6 uses each, chained) as the primary discovery path — that call chain
+// was the main source of slow discovery turnaround; scoping alone is one
+// short non-tool call, and there is now exactly one Claude call per
+// discovery request instead of two.
 import Anthropic from "@anthropic-ai/sdk";
 import { CATEGORIES } from "./types";
-import type { Category, CreatorSummary } from "./types";
+import type { Category } from "./types";
 
-const MAX_RESULTS_PER_CATEGORY = 10; // hard cap, mirrors apifyClient — do not parameterize higher
 const MAX_MESSAGE_CHARS = 500; // matches Composer.tsx's MAX_MESSAGE_LENGTH
+const MAX_KEYWORDS = 3; // keep the Apify shop-search query short and cheap
 
 function getClient(): Anthropic | null {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -20,161 +25,105 @@ function getClient(): Anthropic | null {
   return new Anthropic({ apiKey });
 }
 
-const CREATOR_ITEM_SCHEMA = {
+// Grounds the scoping call in what the brand actually sells, so a vague
+// message ("who can move a lot of product for us?") still scopes to
+// sensible PH TikTok Shop search terms instead of generic beauty keywords.
+// Keep this a short, factual description — it's context for interpreting the
+// user's message, not instructions Claude should follow on its own.
+const BRAND_CONTEXT =
+  "The brand running this tool is Biocostech, a sunscreen/skincare brand selling in the Philippines " +
+  "market. Default to sunscreen/skincare interpretations when the user's message is ambiguous or " +
+  "doesn't name a category, but follow the user's own wording when they're specific about something " +
+  "else (e.g. makeup, haircare).";
+
+// Used both as the no-key/error fallback and as a last-resort default
+// keyword set — always PH-shopper phrasing, never a bare English category
+// name, since these go straight into a TikTok Shop search.
+const DEFAULT_KEYWORDS: Record<Category, string[]> = {
+  beauty: ["makeup finds", "beauty must haves"],
+  skincare: ["skincare routine", "face serum"],
+  sunscreen: ["sunscreen spf50", "sunblock"],
+};
+
+export type ScopedRequest = {
+  category: Category | null;
+  searchKeywords: string[];
+};
+
+const SCOPE_SCHEMA = {
   type: "object",
   properties: {
-    username: { type: "string", description: "TikTok @handle, including the @" },
-    displayName: {
-      type: "string",
-      description:
-        "The account's real display name — the bold name shown at the top of the profile, " +
-        "distinct from the @handle. Example: handle @makeupstorybydar, display name \"Darwin\". " +
-        "These are usually different strings; never produce this by stripping \"@\" from the " +
-        "username — if you can't confirm the real display name, use the handle without the @ only " +
-        "as a last resort.",
+    category: {
+      anyOf: [{ type: "string", enum: CATEGORIES }, { type: "null" }],
+      description: "The product category this message is asking about, or null if it doesn't clearly name one.",
     },
-    profileUrl: { type: "string", description: "Full TikTok profile URL, e.g. https://www.tiktok.com/@handle" },
-    followers: { type: "integer" },
-    engagementRate: { type: "number", description: "0 to 1" },
-    gmv: {
-      type: "integer",
+    searchKeywords: {
+      type: "array",
+      items: { type: "string" },
       description:
-        "Estimated TikTok Shop GMV in PHP, based on followers/engagement/category norms. Not a scraped figure.",
-    },
-    itemsSold: { type: "integer", description: "Estimated items sold, same basis as gmv." },
-    bio: {
-      type: "string",
-      description:
-        "The creator's TikTok bio, copied verbatim from the profile page — not a paraphrase or " +
-        "summary. Include every line exactly as written, especially contact details (email, " +
-        "Viber, mobile, other social links) if the bio has them. A later step extracts contact " +
-        "info from this exact text, so an approximated or generic bio will cause real contact " +
-        "details to be missed even when they're visible on the profile.",
+        "1-3 concise TikTok Shop search phrases (2-4 words each) that best scope this request for a " +
+        "Philippines TikTok Shop search — product or niche terms a PH shopper would type, e.g. " +
+        "\"sunscreen spf50\", \"matte lip tint\". Not a description of the request, an actual search query.",
     },
   },
-  required: [
-    "username",
-    "displayName",
-    "profileUrl",
-    "followers",
-    "engagementRate",
-    "gmv",
-    "itemsSold",
-    "bio",
-  ],
+  required: ["category", "searchKeywords"],
   additionalProperties: false,
 };
 
-// Ask Claude to find real, currently-active Philippines-based TikTok creators
-// for a category, using web search plus web fetch. Web search alone only
-// returns snippets, not literal page content, which tends to produce a
-// paraphrased bio rather than the real one — losing any contact info in it.
-// Web fetch lets the model open a profile URL surfaced by search and read
-// the actual bio before answering (it can only fetch a URL already present
-// in the conversation, which search results satisfy). Results are estimates
-// where TikTok doesn't expose exact figures (GMV/items-sold) — framed as
-// such in the schema description, same "ESTIMATED" contract as the
-// mock/Apify paths.
-export async function discoverWithClaude(category: Category): Promise<CreatorSummary[] | null> {
+// Turns a free-text chat message into a category + search keywords for
+// apifyClient's TikTok Shop scraper. Never throws — falls back to keyword
+// matching / DEFAULT_KEYWORDS on any missing key, refusal, empty result, or
+// error, same contract as the rest of this module.
+export async function scopeRequest(message: string): Promise<ScopedRequest> {
+  const truncated = message.length > MAX_MESSAGE_CHARS ? message.slice(0, MAX_MESSAGE_CHARS) : message;
   const client = getClient();
   if (!client) {
-    console.warn("[discoveryClient] ANTHROPIC_API_KEY not set — skipping Claude discovery");
-    return null;
+    console.warn("[discoveryClient] ANTHROPIC_API_KEY not set — using keyword fallback for scoping");
+    return keywordFallback(truncated);
   }
 
   try {
     const response = await client.messages.parse({
       model: "claude-sonnet-5",
-      max_tokens: 4096,
-      tools: [
-        { type: "web_search_20260209", name: "web_search", max_uses: 6 },
-        { type: "web_fetch_20260209", name: "web_fetch", max_uses: 6 },
-      ],
-      output_config: {
-        format: {
-          type: "json_schema",
-          schema: {
-            type: "object",
-            properties: {
-              // NOTE: `maxItems` is NOT a supported constraint for
-              // output_config.format.schema ("For 'array' type, property
-              // 'maxItems' is not supported" — 400 on every call). The cap is
-              // enforced below in code instead, via .slice().
-              candidates: {
-                type: "array",
-                items: CREATOR_ITEM_SCHEMA,
-              },
-            },
-            required: ["candidates"],
-            additionalProperties: false,
-          },
-        },
-      },
+      max_tokens: 256,
+      // No tools here — this is a scoping call, not a discovery call. Real
+      // creator/GMV data comes from apifyClient.ts.
+      output_config: { format: { type: "json_schema", schema: SCOPE_SCHEMA } },
       messages: [
         {
           role: "user",
           content:
-            `Find up to ${MAX_RESULTS_PER_CATEGORY} real, currently active TikTok creators based in the ` +
-            `Philippines who post ${category} content, ranked by follower count descending. Use web search ` +
-            `to confirm each creator is real and PH-based — do not invent handles. Only include creators with ` +
-            `an explicit Philippines connection (PH hashtags, PH-based content, Filipino audience) — skip ` +
-            `anyone whose region can't be confirmed. For each creator, fetch their TikTok profile page (the ` +
-            `web_fetch tool) once you have its URL from search, and copy the bio field verbatim from that ` +
-            `page — do not paraphrase or summarize it, and do not skip fetching just because search already ` +
-            `gave you a plausible-looking bio. displayName is the creator's real name shown at the top of ` +
-            `their profile (e.g. "Darwin"), not their @handle — read it off the fetched profile page rather ` +
-            `than deriving it from the username. gmv and itemsSold are your estimates (TikTok Shop commerce ` +
-            `data isn't publicly scrapable), reasoned from follower count, engagement rate, and typical PH ` +
-            `creator-commerce rates for this category — do not fabricate a scraped-looking figure.`,
+            `${BRAND_CONTEXT}\n\nA user of the brand's internal tool typed this chat message describing ` +
+            `the TikTok affiliate creators they're looking for:\n\n"${truncated}"\n\nIdentify the product ` +
+            `category (beauty, skincare, or sunscreen — or null if genuinely unclear) and produce up to ` +
+            `${MAX_KEYWORDS} concise TikTok Shop search keywords/phrases that best scope this request.`,
         },
       ],
     });
 
     if (response.stop_reason === "refusal") {
-      console.warn("[discoveryClient] Claude discovery refused");
-      return null;
+      console.warn("[discoveryClient] scoping refused — using keyword fallback");
+      return keywordFallback(truncated);
     }
-
-    const parsed = response.parsed_output as { candidates: Array<Omit<CreatorSummary, "id">> } | null;
-    if (!parsed || !Array.isArray(parsed.candidates) || parsed.candidates.length === 0) {
-      console.warn("[discoveryClient] Claude discovery returned no candidates");
-      return null;
+    const parsed = response.parsed_output as ScopedRequest | null;
+    if (!parsed || !Array.isArray(parsed.searchKeywords) || parsed.searchKeywords.length === 0) {
+      console.warn("[discoveryClient] scoping returned nothing — using keyword fallback");
+      return keywordFallback(truncated);
     }
-
-    return parsed.candidates.slice(0, MAX_RESULTS_PER_CATEGORY).map((c, index) => ({
-      id: `claude-${category}-${index}`,
-      ...c,
-    }));
+    const category = parsed.category && CATEGORIES.includes(parsed.category) ? parsed.category : null;
+    return { category, searchKeywords: parsed.searchKeywords.slice(0, MAX_KEYWORDS) };
   } catch (err) {
-    console.warn("[discoveryClient] live discovery failed, falling back:", err);
-    return null;
+    console.warn("[discoveryClient] scoping failed, using keyword fallback:", err);
+    return keywordFallback(truncated);
   }
 }
 
-// NOTE: a `type: ["string", "null"]` field with `enum: [...CATEGORIES, null]`
-// is rejected by output_config.format.schema ("Enum value 'beauty' does not
-// match declared type" — 400 on every call, structured-outputs schemas are
-// stricter here than plain JSON Schema). `anyOf` with a plain string enum +
-// a separate null branch is the supported way to express "one of these
-// strings, or null".
-const CATEGORY_CLASSIFY_SCHEMA = {
-  type: "object",
-  properties: {
-    category: {
-      anyOf: [{ type: "string", enum: CATEGORIES }, { type: "null" }],
-      description: "The matched category, or null if the message doesn't clearly name one.",
-    },
-  },
-  required: ["category"],
-  additionalProperties: false,
-};
-
-// Keyword fallback used only when the Claude classification call itself fails
-// (missing key, network error, bad response) — never as a substitute for a
-// working classifier. Ordered most-specific-first and with "skin" dropped
-// from the skincare list entirely, so it can't reproduce the old client-side
-// bug where "skin" (from "skincare") matched before "sunscreen" was checked
-// and misrouted "sunscreen for beauty creators" / "skin-friendly sunscreen".
+// Keyword fallback used only when the Claude call itself fails (missing key,
+// network error, bad response, refusal, empty result) — never as a
+// substitute for a working scoping call. Ordered most-specific-first and
+// with "skin" dropped from the skincare list entirely, so it can't reproduce
+// the old client-side bug where "skin" (from "skincare") matched before
+// "sunscreen" was checked and misrouted "sunscreen for beauty creators".
 const CATEGORY_KEYWORDS: Record<Category, string[]> = {
   sunscreen: ["sunscreen", "sunblock", "spf"],
   beauty: ["beauty"],
@@ -182,65 +131,15 @@ const CATEGORY_KEYWORDS: Record<Category, string[]> = {
 };
 const KEYWORD_FALLBACK_ORDER: Category[] = ["sunscreen", "beauty", "skincare"];
 
-function keywordFallbackCategory(message: string): Category | null {
+function keywordFallback(message: string): ScopedRequest {
   const lower = message.toLowerCase();
   for (const category of KEYWORD_FALLBACK_ORDER) {
-    if (CATEGORY_KEYWORDS[category].some((word) => lower.includes(word))) return category;
-  }
-  return null;
-}
-
-// Replaces the old client-side keyword substring-match as the *primary* path
-// (which had a first-match-wins bug: "sunscreen for beauty creators" resolved
-// to "beauty"). Falls back to keywordFallbackCategory whenever the Claude
-// call itself fails or errors, so an API/model problem degrades to "best
-// effort" instead of permanently blocking every free-text message behind the
-// "which category?" prompt — a call that failed and a message that genuinely
-// names no category must not look identical to the caller.
-export async function classifyCategory(message: string): Promise<Category | null> {
-  const client = getClient();
-  const truncated =
-    message.length > MAX_MESSAGE_CHARS ? message.slice(0, MAX_MESSAGE_CHARS) : message;
-
-  if (!client) {
-    console.warn(
-      "[discoveryClient] ANTHROPIC_API_KEY not set — using keyword fallback for classification",
-    );
-    return keywordFallbackCategory(message);
-  }
-
-  try {
-    const response = await client.messages.parse({
-      model: "claude-sonnet-5",
-      max_tokens: 256,
-      output_config: { format: { type: "json_schema", schema: CATEGORY_CLASSIFY_SCHEMA } },
-      messages: [
-        {
-          role: "user",
-          content:
-            `Which product category, if any, does this message ask about — beauty, skincare, or ` +
-            `sunscreen? If it names more than one, or none clearly, return null.\n\nMessage: "${truncated}"`,
-        },
-      ],
-    });
-
-    if (response.stop_reason === "refusal") {
-      console.warn("[discoveryClient] category classification refused — using keyword fallback");
-      return keywordFallbackCategory(message);
+    if (CATEGORY_KEYWORDS[category].some((word) => lower.includes(word))) {
+      return { category, searchKeywords: DEFAULT_KEYWORDS[category] };
     }
-    const parsed = response.parsed_output as { category: Category | null } | null;
-    if (!parsed || !parsed.category || !CATEGORIES.includes(parsed.category)) {
-      // Claude explicitly found no category — trust that over the keyword
-      // fallback for a live, successful call; only errors/no-key/refusal
-      // above fall back to keywords.
-      return null;
-    }
-    return parsed.category;
-  } catch (err) {
-    console.warn(
-      "[discoveryClient] category classification failed, using keyword fallback:",
-      err,
-    );
-    return keywordFallbackCategory(message);
   }
+  // Genuinely ambiguous, even by keyword match — Biocostech defaults to
+  // sunscreen/skincare, so fall back to sunscreen keywords rather than a
+  // generic beauty search.
+  return { category: null, searchKeywords: DEFAULT_KEYWORDS.sunscreen };
 }

@@ -7,24 +7,23 @@ import {
 } from "@/lib/affiliate-finder/conversationState";
 import type { Category, CreatorDetail, CreatorSummary } from "@/lib/affiliate-finder/types";
 import { ChatThread } from "./ChatThread";
-import { CategoryPillGroup } from "./CategoryPillGroup";
+import { Composer } from "./Composer";
 import { ThemeToggle } from "./ThemeToggle";
 
 export function AffiliateFinderShell() {
   const [state, dispatch] = useReducer(conversationReducer, initialConversationState);
 
-  // Category is always known up front here — the pill row is the only entry
-  // point (free-text chat was tried and reverted: it depended on a
-  // classifyCategory call, and structured-output schema bugs there caused
-  // discovery to silently fall through to mock data far more than expected).
-  // Keeping this pill-only path removes that whole failure surface.
-  async function runDiscovery(category: Category) {
-    dispatch({ type: "DISCOVERY_START", category });
+  // Free-text chat is the only entry point — Claude's job server-side is to
+  // read this message and scope it down into a category + TikTok Shop
+  // search keywords for Apify (see discoveryClient.ts's scopeRequest);
+  // Apify then does the actual creator discovery.
+  async function runDiscovery(message: string) {
+    dispatch({ type: "DISCOVERY_START" });
     try {
       const res = await fetch("/api/discover", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ category }),
+        body: JSON.stringify({ message }),
       });
       if (res.status === 429) {
         const data = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -108,13 +107,12 @@ export function AffiliateFinderShell() {
 
       {state.stage === "intake" && (
         <div className="border-t border-border">
-          <div className="mx-auto flex w-full max-w-6xl flex-col gap-3 p-6 pt-4">
-            <p className="text-sm text-muted-foreground">Pick a category to get started:</p>
-            <CategoryPillGroup
+          <div className="mx-auto w-full max-w-6xl p-6 pt-4">
+            <Composer
               disabled={state.pending}
-              onSelect={(category) => {
-                dispatch({ type: "USER_MESSAGE", content: `Top affiliates — ${category}` });
-                void runDiscovery(category);
+              onSend={(content) => {
+                dispatch({ type: "USER_MESSAGE", content });
+                void runDiscovery(content);
               }}
             />
           </div>

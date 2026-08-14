@@ -1,12 +1,10 @@
 import { NextResponse } from "next/server";
 import { discoverTopCreators } from "@/lib/affiliate-finder/apifyClient";
-import { classifyCategory, discoverWithClaude } from "@/lib/affiliate-finder/discoveryClient";
+import { scopeRequest } from "@/lib/affiliate-finder/discoveryClient";
 import { checkRateLimit, getClientKey } from "@/lib/rateLimit";
 import type { Category } from "@/lib/affiliate-finder/types";
 
 export const runtime = "nodejs";
-
-const VALID_CATEGORIES: Category[] = ["beauty", "skincare", "sunscreen"];
 
 // Apify free tier has a small monthly credit balance — keep discovery calls
 // infrequent regardless of how the UI is driven.
@@ -21,25 +19,21 @@ export async function POST(request: Request) {
     );
   }
 
-  const body = (await request.json()) as { category?: string; message?: string };
-
-  let category = body.category as Category | undefined;
-  if (!category && typeof body.message === "string" && body.message.trim()) {
-    // Server-side classification replaces the old client-side keyword match —
-    // fixes the first-match-wins bug ("sunscreen for beauty creators").
-    category = (await classifyCategory(body.message)) ?? undefined;
+  const body = (await request.json()) as { message?: string };
+  if (typeof body.message !== "string" || !body.message.trim()) {
+    return NextResponse.json({ error: "Tell me what kind of affiliates you're looking for." }, { status: 400 });
   }
 
-  if (!category || !VALID_CATEGORIES.includes(category)) {
-    return NextResponse.json(
-      { error: "Which category should I search? Try beauty, skincare, or sunscreen." },
-      { status: 400 },
-    );
-  }
+  // Claude's only job here is scoping: read the free-text message and turn
+  // it into a category + TikTok Shop search keywords. Apify does the actual
+  // discovery — it never falls back to Claude for candidates, only to its
+  // own hashtag scraper, then mock (see apifyClient.ts).
+  const { category, searchKeywords } = await scopeRequest(body.message);
+  // Biocostech defaults to sunscreen/skincare when a message is genuinely
+  // ambiguous — see discoveryClient.ts's BRAND_CONTEXT — so the route never
+  // has to bounce back asking "which category?".
+  const resolvedCategory: Category = category ?? "sunscreen";
 
-  // Claude (with web search) is the primary discovery source; Apify is the
-  // fallback, and Apify itself falls back to mock data internally. Neither
-  // discoverWithClaude nor discoverTopCreators ever throws.
-  const candidates = (await discoverWithClaude(category)) ?? (await discoverTopCreators(category));
-  return NextResponse.json({ category, candidates });
+  const candidates = await discoverTopCreators(resolvedCategory, searchKeywords);
+  return NextResponse.json({ category: resolvedCategory, candidates });
 }
