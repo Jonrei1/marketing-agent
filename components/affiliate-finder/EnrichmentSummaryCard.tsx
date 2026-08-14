@@ -7,6 +7,10 @@ import { DataTable, type DataTableColumn } from "@/components/shared/data-table"
 import { formatFollowers, formatMoney } from "@/lib/affiliate-finder/format";
 import type { ContactField, CreatorDetail } from "@/lib/affiliate-finder/types";
 
+// Biocostech is the only brand this tool ever discovers for — see BRAND_CONTEXT
+// in lib/affiliate-finder/discoveryClient.ts.
+const BRAND_NAME = "Biocostech";
+
 function ContactCell({ field }: { field: ContactField }) {
   if (field.found) {
     return <span className="text-emerald-500">{field.value}</span>;
@@ -21,26 +25,47 @@ function csvEscape(value: string): string {
   return value;
 }
 
+// Column order/names mirror the `affiliate_list` table in the ecom-affiliate-project
+// portal (lib/db/schema/affiliate_list.ts) so this file can be dragged straight into
+// its bulk importer (lib/affiliates/import.ts) with every column auto-mapped — that
+// importer normalizes headers (lowercased, non-alphanumeric stripped) before matching
+// against its alias table, so "Full Name" / "Contact No" / "TikTok Live" etc. all
+// resolve correctly as long as the words themselves match.
+//
+// Mapping notes:
+// - brandname is fixed to Biocostech — this tool never discovers for any other brand.
+// - contact_no takes mobile first, falling back to viber, since the portal has one
+//   generic contact-number column rather than separate mobile/viber fields.
+// - followers/gmv/items_sold are varchar columns holding pre-formatted display text
+//   in that schema (e.g. "747.9K", "₱10K+", "5.78K") — followers and items_sold use
+//   the same plain K/M suffix, gmv adds the ₱ prefix — so we export formatted
+//   strings matching that convention rather than raw numbers.
+// - status is left blank; the importer defaults any missing/invalid status to
+//   "in_progress".
 function downloadCsv(details: CreatorDetail[]) {
   const headers = [
-    "Username",
-    "Display Name",
-    "Profile URL",
-    "Email",
-    "Viber",
-    "Mobile",
-    "Followers",
-    "GMV (estimated)",
+    "brandname",
+    "fullname",
+    "username",
+    "email",
+    "contact_no",
+    "tiktok_live",
+    "followers",
+    "gmv",
+    "items_sold",
+    "status",
   ];
   const rows = details.map((d) => [
-    d.username,
+    BRAND_NAME,
     d.displayName,
-    d.profileUrl,
+    d.username,
     d.email.found ? d.email.value : "",
-    d.viber.found ? d.viber.value : "",
-    d.mobile.found ? d.mobile.value : "",
-    String(d.followers),
-    String(d.gmv),
+    d.mobile.found ? d.mobile.value : d.viber.found ? d.viber.value : "",
+    d.profileUrl,
+    formatFollowers(d.followers),
+    formatMoney(d.gmv),
+    formatFollowers(d.itemsSold),
+    "",
   ]);
   const csv = [headers, ...rows]
     .map((row) => row.map((cell) => csvEscape(cell)).join(","))

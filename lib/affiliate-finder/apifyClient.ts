@@ -27,7 +27,6 @@ const SHOP_ACTOR = "unseenuser~tiktok-shop-scraper";
 const PROFILE_ACTOR = "clockworks~tiktok-scraper";
 const MAX_RESULTS_PER_CATEGORY = 10; // hard cap, do not parameterize this higher
 const MAX_PRODUCTS_FOR_CREATOR_LOOKUP = 5; // how many top-GMV products to pull affiliates for
-const APIFY_TIMEOUT_MS = 20_000; // Apify is primary now — bounded so a slow run can't stall the chat
 const COUNTRY_CODE = "PH";
 
 type ShopProduct = {
@@ -69,7 +68,6 @@ async function runApifyActor<T>(actor: string, input: Record<string, unknown>, t
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
-      ...(APIFY_TIMEOUT_MS ? { signal: AbortSignal.timeout(APIFY_TIMEOUT_MS) } : {}),
     },
   );
   if (!res.ok) {

@@ -9,6 +9,20 @@ wipes it. That is correct, not a bug.
 This document is written for a Claude Code session running **in the dashboard repo**, with this
 repo available to copy from.
 
+> **⚠ Known drift — read before copying anything.** If the dashboard's version of this chat still
+> greets with *"I can search TikTok for affiliates in beauty, skincare, or sunscreen — pick a
+> category to start"* (or shows any category-pill UI), that copy predates this repo's free-text-only
+> refactor and is **stale**, not a different intentional behaviour. The current source has no
+> category-selection step anywhere — confirmed by grepping this repo for that string (no matches)
+> and by `conversationState.ts`'s actual welcome message:
+> `"Hi! Tell me what kind of TikTok affiliates you're looking for and I'll pull the top 10 ranked
+> creators for it."` Fix: **re-copy `lib/affiliate-finder/conversationState.ts` from this repo,
+> verbatim, overwriting whatever is in the dashboard**, and delete any leftover category-pill
+> component in the dashboard (this repo has none — `CategoryPillGroup.tsx` was removed here; see
+> git history). Do not patch the old greeting string in place — the whole file is out of sync, not
+> just that one line. After re-copying, re-check `Composer.tsx` and `DiscoveryResultCard.tsx` too:
+> if one file drifted, others copied at the same time likely did too.
+
 ---
 
 ## 0. TL;DR of the move
@@ -280,6 +294,12 @@ TypeScript check.)
 ## 9. Post-port checklist
 
 - [ ] All files in §1 copied; excluded files in §1 **not** copied.
+- [ ] Welcome message in the running dashboard reads *"Hi! Tell me what kind of TikTok affiliates
+      you're looking for…"* — **not** the old "pick a category to start" text. If it shows the old
+      text, `conversationState.ts` (and likely `Composer.tsx`/`DiscoveryResultCard.tsx`) is a stale
+      copy — re-copy from this repo per the drift warning at the top of this doc.
+- [ ] No category-pill component exists anywhere in the dashboard's affiliate-finder components —
+      this repo has none (`CategoryPillGroup.tsx` was deleted here).
 - [ ] `@anthropic-ai/sdk` and `lucide-react` installed.
 - [ ] `ANTHROPIC_API_KEY` and `APIFY_TOKEN` present in the dashboard's runtime env.
 - [ ] `AffiliateFinderShell` header + `ThemeToggle` removed; `h-dvh` → `h-full`.
